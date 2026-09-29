@@ -15,16 +15,30 @@
 - 返回 `added_pairings`、`total_cost` 与修复后图上的完整 `assignment`
   （沿用上述字典序最小规则）；原图已可行时返回成本 0 的空补充。
 
+`POST /reassign` 面向**会议已发布完整评审分配、随后部分允许配对被撤销**的场景：
+在原输入之外接收**已发布分配**、**已完成评审人 ID** 与**撤销配对**，
+在「未撤销且未被已完成者占用」的配对上给出新的完整分配：
+
+- 已完成评审人的配对**锁定**：既不得被撤销，也不得改变；
+- 先使**相对已发布分配的改动评审人人数最少**；
+- 平局时，按评审人 ID 升序的**稿件 ID 序列字典序最小**；
+- 返回完整 `assignment`（含 `forced` / `alternative` 标注，强制性相对于
+  锁定已完成者后的可行解集）与 `changed_reviewer_ids`；
+- 锁定后无法完成时**不返回部分成功**：返回**未完成部分**（剩余子图）的
+  基数最大匹配、未匹配 ID 与 Hall 定理证人。
+
 状态码约定：
 
-- 存在完美匹配（或修复成功） → `200`
-- 不存在完美匹配（或合并全部候选仍不可行） → `409`，返回基数最大的匹配、
-  未匹配的评审人/稿件 ID，以及一份 **Hall 定理证人**（`hall_witness`），**不返回部分成功**
-- 重复 ID、重复配对、未知引用、数量不等、空列表、候选与原边重叠、非正整数成本等
-  输入问题 → `422`，错误定位到具体字段与下标
+- 存在完美匹配（或修复成功、改派成功） → `200`
+- 不存在完美匹配（或合并全部候选仍不可行、锁定后剩余部分不可行） → `409`，
+  返回基数最大的匹配、未匹配的评审人/稿件 ID，以及一份 **Hall 定理证人**
+  （`hall_witness`），**不返回部分成功**
+- 重复 ID、重复配对、未知引用、数量不等、空列表、候选与原边重叠、非正整数成本、
+  已发布分配不是原允许对上的完美匹配、撤销配对不属于原允许配对、
+  撤销/改动已完成者配对等输入问题 → `422`，错误定位到具体字段与下标
 
 技术栈：Python · FastAPI · Pydantic v2 · NetworkX（Hopcroft–Karp + 交替有向图强连通分量
-+ Edmonds 开花算法最小权完美匹配）。
++ Edmonds 开花算法最小权完美匹配 / 最小改动改派）。
 
 ---
 
@@ -39,6 +53,7 @@ docker compose up --build
 - API 根地址：<http://localhost:8000/>
 - 审计端点：`POST http://localhost:8000/audit`
 - 修复端点：`POST http://localhost:8000/repair`
+- 改派端点：`POST http://localhost:8000/reassign`
 - 交互式文档（Swagger UI）：<http://localhost:8000/docs>
 - OpenAPI 模式：<http://localhost:8000/openapi.json>
 - 健康检查：<http://localhost:8000/healthz>
@@ -364,6 +379,174 @@ curl -s -X POST http://localhost:8000/repair \
 
 ---
 
+## POST /reassign（发布后撤销配对的最小改动改派）
+
+会议发布完整评审分配后，部分允许配对可能被撤销（评审人回避变化等），
+同时部分评审人**已经完成评审**。本端点在 `/audit` 的三个字段之外接受：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `published_assignment` | `{reviewer_id, manuscript_id}[]` | **必填、非空**；必须是 `allowed_pairings` 上的**完美匹配**（每位评审人与每篇稿件各恰好出现一次，无重复） |
+| `completed_reviewer_ids` | `string[]` | 可省略/为空；无重复、无空串、均须为已知评审人。其发布配对**锁定**：不得撤销、不得改变 |
+| `revoked_pairings` | `{reviewer_id, manuscript_id}[]` | 可省略/为空；无重复；每条必须**属于** `allowed_pairings`；不得撤销任何已完成者的发布配对 |
+
+其余（未完成）评审人只可使用**未撤销且未被已完成者占用**的配对。
+优化目标按字典优先级为：
+
+1. **改动人数最少**：相对 `published_assignment`，重新分配后稿件发生变化的
+   评审人数量最小（已完成者恒不计入）；
+2. **平局取稿件序列字典序最小**：按评审人 ID 升序排列，其被分配稿件 ID
+   构成的序列字典序最小。
+
+### 示例请求（200，最小改动 + 平局字典序）
+
+```bash
+curl -s -X POST http://localhost:8000/reassign \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reviewers": ["r0", "r1", "r2", "r3"],
+    "manuscripts": ["m0", "m1", "m2", "m3"],
+    "allowed_pairings": [
+      {"reviewer_id": "r0", "manuscript_id": "m0"},
+      {"reviewer_id": "r0", "manuscript_id": "m1"},
+      {"reviewer_id": "r1", "manuscript_id": "m0"},
+      {"reviewer_id": "r1", "manuscript_id": "m1"},
+      {"reviewer_id": "r2", "manuscript_id": "m2"},
+      {"reviewer_id": "r2", "manuscript_id": "m3"},
+      {"reviewer_id": "r3", "manuscript_id": "m2"},
+      {"reviewer_id": "r3", "manuscript_id": "m3"}
+    ],
+    "published_assignment": [
+      {"reviewer_id": "r0", "manuscript_id": "m0"},
+      {"reviewer_id": "r1", "manuscript_id": "m1"},
+      {"reviewer_id": "r2", "manuscript_id": "m2"},
+      {"reviewer_id": "r3", "manuscript_id": "m3"}
+    ],
+    "completed_reviewer_ids": ["r3"],
+    "revoked_pairings": [
+      {"reviewer_id": "r0", "manuscript_id": "m0"}
+    ]
+  }'
+```
+
+`r3` 已完成 `m3`（锁定，`m3` 也不再开放给他人）；撤销 `r0–m0` 后，
+`r0/r1` 必须交换（2 人改动，无法更少）：
+
+```json
+{
+  "perfect_match_exists": true,
+  "assignment": [
+    {"reviewer_id": "r0", "manuscript_id": "m1", "forced": true, "alternative": null},
+    {"reviewer_id": "r1", "manuscript_id": "m0", "forced": true, "alternative": null},
+    {"reviewer_id": "r2", "manuscript_id": "m2", "forced": true, "alternative": null},
+    {"reviewer_id": "r3", "manuscript_id": "m3", "forced": true, "alternative": null}
+  ],
+  "changed_reviewer_ids": ["r0", "r1"]
+}
+```
+
+平局字典序示例（完全图 K3,3，仅撤销 `r1–m1`，无已完成者）。两种改派都只动 2 人：
+
+- 序列 `(m1, m0, m2)`：`r0→m1, r1→m0, r2→m2`；
+- 序列 `(m0, m2, m1)`：`r0→m0, r1→m2, r2→m1`。
+
+按评审人升序比较稿件序列，`(m0, m2, m1)` 第一位更小，故服务返回后者，
+`changed_reviewer_ids` 为 `["r1", "r2"]`。
+
+字段含义：
+
+- `assignment`：覆盖**全体**评审人的完整分配（含已完成者的锁定配对），
+  按评审人 ID 升序；
+- `forced` / `alternative`：强制性相对于**锁定已完成者之后**仍可行的全部改派。
+  锁定边恒为 `forced=true`、`alternative=null`；任何非强制边给出的
+  `alternative` 都是覆盖全体评审人的完整合法分配，且**保持已完成者配对不变**；
+- `changed_reviewer_ids`：相对已发布分配发生改动的评审人 ID（已升序），
+  已完成者恒不在其中；撤销一条发布方案未使用的允许边时可能无人改动，返回 `[]`。
+
+### 409 响应（锁定已完成者后剩余部分无法完成）
+
+不返回部分成功。`maximum_matching` / `unmatched_*` / `hall_witness`
+**全部只针对未完成部分**——即剔除已完成评审人节点及其锁定稿件节点后的
+剩余二部图；已完成者的配对不受影响、不出现在这些字段中：
+
+```json
+{
+  "perfect_match_exists": false,
+  "detail": "撤销配对并锁定已完成者后，未完成部分不存在完美匹配；以下为该部分基数最大的匹配、未匹配双方及 Hall 定理证人（已完成者的锁定配对不受影响，未包含在内）。",
+  "maximum_matching": [
+    {"reviewer_id": "r1", "manuscript_id": "m0"}
+  ],
+  "unmatched_reviewer_ids": ["r0"],
+  "unmatched_manuscript_ids": ["m1"],
+  "hall_witness": {
+    "reviewer_ids": ["r0"],
+    "neighboring_manuscript_ids": [],
+    "deficiency": 1
+  }
+}
+```
+
+上例中 `r2` 已完成并锁定 `m2`；撤销 `r0–m0` 后 `r0` 的另一条边指向已锁定的
+`m2`，剩余部分 `{r0, r1}` 对 `{m0, m1}` 无法完美匹配（`r0` 无可用稿件）。
+`hall_witness` 的邻居按**剩余可用配对**（已剔除撤销边与锁定占用）计算，
+结构与 `/audit` 完全一致。
+
+### 422 响应（校验失败，精确定位）
+
+在 `/audit` 的全部校验之上，本端点额外引入以下错误类型，一次请求聚合返回：
+
+| 错误类型 | 触发条件 | `loc` 定位 |
+| --- | --- | --- |
+| `published_pairing_not_allowed` | 已发布配对不属于 `allowed_pairings` | `body.published_assignment.<下标>` |
+| `published_assignment_not_perfect` | 已发布分配中某评审人/稿件重复出现，或缺人/缺稿不构成完美匹配 | 重复时定位到 `body.published_assignment.<下标>`；基数不符定位到 `body.published_assignment` |
+| `duplicate_published_pairing` | 已发布配对整对重复 | `body.published_assignment.<下标>` |
+| `duplicate_completed_reviewer_id` | 已完成评审人 ID 重复 | `body.completed_reviewer_ids.<下标>` |
+| `duplicate_revoked_pairing` | 撤销配对自相重复 | `body.revoked_pairings.<下标>` |
+| `revoked_pairing_not_allowed` | 撤销配对不属于原 `allowed_pairings` | `body.revoked_pairings.<下标>` |
+| `revoked_completed_pairing` | 撤销的是某已完成者的发布配对 | `body.revoked_pairings.<下标>` |
+| `unknown_reviewer` / `unknown_manuscript` | 已发布分配、撤销配对或已完成列表引用未知 ID | 对应字段与下标 |
+| `missing` / `too_short` | 缺少 `published_assignment` 或其为空列表 | 对应字段 |
+
+示例（撤销已完成者的配对，直接拒绝，不做任何改动）：
+
+```bash
+curl -s -X POST http://localhost:8000/reassign \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reviewers": ["r0", "r1", "r2"],
+    "manuscripts": ["m0", "m1", "m2"],
+    "allowed_pairings": [
+      {"reviewer_id": "r0", "manuscript_id": "m0"},
+      {"reviewer_id": "r1", "manuscript_id": "m1"},
+      {"reviewer_id": "r2", "manuscript_id": "m2"}
+    ],
+    "published_assignment": [
+      {"reviewer_id": "r0", "manuscript_id": "m0"},
+      {"reviewer_id": "r1", "manuscript_id": "m1"},
+      {"reviewer_id": "r2", "manuscript_id": "m2"}
+    ],
+    "completed_reviewer_ids": ["r0"],
+    "revoked_pairings": [
+      {"reviewer_id": "r0", "manuscript_id": "m0"}
+    ]
+  }'
+```
+
+```json
+{
+  "detail": [
+    {
+      "type": "revoked_completed_pairing",
+      "loc": ["body", "revoked_pairings", 0],
+      "msg": "已完成评审人 'r0' 的配对 ('r0', 'm0') 不得撤销",
+      "input": {"reviewer_id": "r0", "manuscript_id": "m0"}
+    }
+  ]
+}
+```
+
+---
+
 ## 算法说明
 
 - **最大匹配 / 完美匹配判定**：NetworkX 的 Hopcroft–Karp
@@ -396,6 +579,17 @@ curl -s -X POST http://localhost:8000/repair \
 - **修复后的 assignment**：在「允许配对 + 新增配对」图上复用上述全部规则
   （字典序最小分配 + 强制性标注）；由正成本可证该分配恰好用完所有新增边。
   合并全部候选仍不可行时，在合并图上复用 Hall 证人构造，作为 409 的解释。
+- **发布后撤销/改派（/reassign）**：已完成者的配对视为锁定边，剩余子图为
+  「原允许配对 − 撤销边 − 涉及已完成者或锁定稿件的边」。两级优化目标一次
+  加权完美匹配求解（`networkx.max_weight_matching`）：设剩余评审人按 ID 升序为
+  r₀..r_{p−1}，取 q = n+1，边 (r_i, m) 赋权
+  `q^p·[该边是 r_i 的发布边] − rank(m)·q^(p−1−i)`。因 rank(m) ≤ n−1 < q，
+  位权编码无进位，最大化权和先最大化保留数（即最小化改动人数），再令稿件序列
+  字典序最小；保留奖励 q^p 严格大于字典序部分的最大可能差值，主次层级不会串扰，
+  且最优分配唯一确定，与开花算法内部平局无关。剩余部分不可行时，在剩余子图上
+  复用字典序最小最大匹配与 Hall 证人构造（409，证人邻居按剩余可用配对计算）。
+  强制性在剩余子图上用同一套 SCC/交替环方法计算，锁定边恒强制；替代分配补回
+  全部锁定边，故任何替代分配都不改变已完成者的配对。
 
 适用规模：典型会议量级（两侧各 ≤100、每人若干候选）亚秒级完成；
 数百规模也可在数秒级返回。
@@ -405,13 +599,14 @@ curl -s -X POST http://localhost:8000/repair \
 ```
 app/
   __init__.py
-  main.py        # FastAPI 路由（/audit、/repair）、422/409 语义校验与响应组装
-  matching.py    # 二部图、确定性匹配、SCC 强制性、交替环替代分配、Hall 证人、最小成本修复
+  main.py        # FastAPI 路由（/audit、/repair、/reassign）、422/409 语义校验与响应组装
+  matching.py    # 二部图、确定性匹配、SCC 强制性、交替环替代分配、Hall 证人、最小成本修复、撤销后改派
   schemas.py     # Pydantic 请求/响应模型
 tests/
   test_api.py    # HTTP 层：200/409/422、Hall 证人与错误定位
   test_matching.py# 算法层：200 组随机图全排列暴力交叉验证 + Hall 证人不变量
   test_repair.py # /repair：最小成本、平局字典序、422 定位 + 300 组暴力交叉验证
+  test_reassign.py # /reassign：锁定/最小改动/字典序平局、409 剩余子图、422 定位 + 500 组暴力交叉验证
 Dockerfile
 docker-compose.yml
 requirements.txt

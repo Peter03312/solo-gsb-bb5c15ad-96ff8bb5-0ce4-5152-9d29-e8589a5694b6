@@ -61,6 +61,29 @@ M-交替路径（同一交替有向图定向）遍历可达节点 Z：
   沿用字典序最小规则；由正成本可证该分配恰好用完所有新增边
   （否则其候选边子集成本更低，与最小性矛盾）；
 - 合并全部候选仍不可行时，在合并图上复用 Hall 证人解释缺口（409）。
+
+发布后撤销与改派（POST /reassign）
+----------------------------------
+已发布分配为原允许对上的完美匹配；部分允许配对被撤销，部分评审人已
+完成评审（其配对既不得撤销也不得改变，视为锁定）。在「未撤销且未被
+已完成者占用」的剩余二部图上求改派方案：
+
+- 主目标：相对已发布分配的改动评审人人数最少（最大化保留数）；
+- 平局：按评审人 ID 升序的稿件 ID 序列字典序最小。
+
+设剩余（未完成）评审人按 ID 升序为 r_0..r_{p-1}，稿件在全量稿件中的
+升序序号为 rank（0..n-1），取 q = n+1：边 (r_i, m) 赋权
+``保留奖励 * [发布边] - rank(m) * q^(p-1-i)``，保留奖励取 q^p。
+由于 rank ≤ n-1 < q，位权编码无进位，字典序比较等价于该数比较；
+而字典序部分的最大可能差值 (n-1)(q^p-1)/n < q^p，一次 max_weight_matching
+同时确定两个层级，最优解的分配唯一确定，与开花算法内部平局无关。
+
+无法完成时不返回部分成功：在剩余子图上返回基数最大匹配、两侧未匹配
+ID 与 Hall 证人（构造与 /audit 完全相同，只是图换成剩余子图）。
+
+强制性标注相对于「锁定已完成者」后的可行改派解集：锁定边恒为强制；
+其余边的强制性与替代分配在剩余子图上计算，替代分配补回全部锁定边，
+故任何 alternative 都不改变已完成者的配对。
 """
 
 from dataclasses import dataclass, field
@@ -371,6 +394,62 @@ def hall_witness(
     )
 
 
+@dataclass
+class ReassignResult:
+    """发布后撤销/改派计算结果。
+
+    - ``feasible`` 为 True：``pairs`` 为带强制性标注的完整分配
+      （含已完成者的锁定配对，按评审人 ID 升序），``changed_reviewer_ids``
+      为相对已发布分配发生改动的评审人 ID（已升序）；
+    - ``feasible`` 为 False：``pairs`` 为未完成部分（剩余子图）上的
+      基数最大匹配 (rid, mid)，``unmatched_reviewers`` /
+      ``unmatched_manuscripts`` 为剩余双方中未匹配的 ID，
+      ``hall_witness`` 为剩余子图上的 Hall 证人，
+      ``locked_pairs`` 为已完成者的锁定配对（用于组装完整匹配）。
+    """
+
+    feasible: bool
+    pairs: list
+    changed_reviewer_ids: list[str] = field(default_factory=list)
+    unmatched_reviewers: list[str] = field(default_factory=list)
+    unmatched_manuscripts: list[str] = field(default_factory=list)
+    hall_witness: HallWitness | None = None
+    locked_pairs: list[tuple[str, str]] = field(default_factory=list)
+
+
+def _annotate_perfect_matching(
+    graph: nx.Graph,
+    canonical: list[tuple[str, str]],
+) -> list[tuple[str, str, bool, list[tuple[str, str]] | None]]:
+    """对给定完美匹配 canonical 逐对标注强制性并构造替代分配。
+
+    强制性是匹配无关的（某边属于全部完美匹配与否不随所选匹配改变），
+    故可直接对调用方给出的确定性匹配做 SCC 分解；替代分配由含该匹配边
+    的最短交替环翻转得到，见模块文档。
+    """
+    digraph = _build_alternating_digraph(graph, canonical)
+    component: dict[tuple[str, str], int] = {}
+    for index, members in enumerate(nx.strongly_connected_components(digraph)):
+        for node in members:
+            component[node] = index
+
+    entries: list[tuple[str, str, bool, list[tuple[str, str]] | None]] = []
+    for reviewer_id, manuscript_id in canonical:
+        same_scc = (
+            component[_rnode(reviewer_id)] == component[_mnode(manuscript_id)]
+        )
+        if not same_scc:
+            # 两端不同 SCC：该边不在任何交替环上，为强制边。
+            entries.append((reviewer_id, manuscript_id, True, None))
+            continue
+        # 同一 SCC：非强制，给出环翻转得到的完整替代分配。
+        alternative = _cycle_alternative(
+            digraph, canonical, reviewer_id, manuscript_id
+        )
+        entries.append((reviewer_id, manuscript_id, False, alternative))
+    return entries
+
+
 def run_audit(
     reviewers: list[str],
     manuscripts: list[str],
@@ -402,27 +481,7 @@ def run_audit(
     canonical = lex_smallest_matching(graph, reviewers_sorted, len(reviewers))
     assert canonical is not None
 
-    # 交替有向图 + 强连通分量：一次 O(V+E) 得到全部强制边。
-    digraph = _build_alternating_digraph(graph, canonical)
-    component: dict[tuple[str, str], int] = {}
-    for index, members in enumerate(nx.strongly_connected_components(digraph)):
-        for node in members:
-            component[node] = index
-
-    entries: list[tuple[str, str, bool, list[tuple[str, str]] | None]] = []
-    for reviewer_id, manuscript_id in canonical:
-        same_scc = (
-            component[_rnode(reviewer_id)] == component[_mnode(manuscript_id)]
-        )
-        if not same_scc:
-            # 两端不同 SCC：该边不在任何交替环上，为强制边。
-            entries.append((reviewer_id, manuscript_id, True, None))
-            continue
-        # 同一 SCC：非强制，给出环翻转得到的完整替代分配。
-        alternative = _cycle_alternative(
-            digraph, canonical, reviewer_id, manuscript_id
-        )
-        entries.append((reviewer_id, manuscript_id, False, alternative))
+    entries = _annotate_perfect_matching(graph, canonical)
 
     return AuditResult(
         perfect_match_exists=True,
@@ -512,4 +571,132 @@ def run_repair(
         added=added,
         total_cost=total_cost,
         audit=run_audit(reviewers, manuscripts, list(pairings) + added),
+    )
+
+
+def run_reassign(
+    reviewers: list[str],
+    manuscripts: list[str],
+    pairings: list[tuple[str, str]],
+    published: list[tuple[str, str]],
+    completed: list[str],
+    revoked: list[tuple[str, str]],
+) -> ReassignResult:
+    """发布后撤销配对、锁定已完成者后的改派。
+
+    入参均已通过 API 层语义校验：
+
+    - ``pairings`` 为原允许配对（无重复、引用已知）；
+    - ``published`` 是 ``pairings`` 上的完美匹配（每侧各一次）；
+    - ``completed`` 为已完成评审人 ID（无重复、均已知）；
+    - ``revoked`` 为原允许配对子集，且不含任何已完成者的发布配对。
+    """
+    published_of = dict(published)
+    completed_set = set(completed)
+    locked_pairs = sorted(
+        (r, published_of[r]) for r in completed if r in published_of
+    )
+    locked_reviewers = {r for r, _ in locked_pairs}
+    locked_manuscripts = {m for _, m in locked_pairs}
+
+    revoked_set = set(revoked)
+    # 剩余可用边：未撤销，且不属于已完成者（其边锁定，不参与重算），
+    # 也不指向已被已完成者占用的稿件。
+    residual_edges = [
+        (r, m)
+        for r, m in pairings
+        if (r, m) not in revoked_set
+        and r not in locked_reviewers
+        and m not in locked_manuscripts
+    ]
+    free_reviewers = sorted(set(reviewers) - locked_reviewers)
+    free_manuscripts = sorted(set(manuscripts) - locked_manuscripts)
+
+    residual_graph = build_graph(
+        free_reviewers, free_manuscripts, residual_edges
+    )
+    target = len(free_reviewers)
+    residual_max_size = _max_matching_size(residual_graph)
+
+    # 剩余部分无法完美匹配：409——剩余子图上的基数最大匹配与 Hall 证人。
+    if residual_max_size != target:
+        pairs = lex_smallest_matching(
+            residual_graph, free_reviewers, residual_max_size
+        )
+        assert pairs is not None
+        matched_reviewers = {r for r, _ in pairs}
+        matched_manuscripts = {m for _, m in pairs}
+        unmatched_reviewers = sorted(set(free_reviewers) - matched_reviewers)
+        return ReassignResult(
+            feasible=False,
+            pairs=pairs,
+            unmatched_reviewers=unmatched_reviewers,
+            unmatched_manuscripts=sorted(
+                set(free_manuscripts) - matched_manuscripts
+            ),
+            hall_witness=hall_witness(
+                residual_graph, pairs, unmatched_reviewers
+            ),
+            locked_pairs=locked_pairs,
+        )
+
+    # 可行：一次加权完美匹配同时确定
+    # 「改动人数最少 → 稿件序列字典序最小」两个层级，见模块文档。
+    p = len(free_reviewers)
+    n = len(reviewers)
+    q = n + 1
+    keep_bonus = q**p
+    rank = {manuscript_id: index for index, manuscript_id in enumerate(sorted(manuscripts))}
+
+    weighted = nx.Graph()
+    weighted.add_nodes_from((_rnode(r) for r in free_reviewers), side=REVIEWER)
+    weighted.add_nodes_from((_mnode(m) for m in free_manuscripts), side=MANUSCRIPT)
+    for position, reviewer_id in enumerate(free_reviewers):
+        place_weight = q ** (p - 1 - position)
+        for _, manuscript_id in residual_graph.adj[_rnode(reviewer_id)]:
+            keep = reviewer_id in published_of and published_of[reviewer_id] == manuscript_id
+            weight = (keep_bonus if keep else 0) - rank[manuscript_id] * place_weight
+            weighted.add_edge(
+                _rnode(reviewer_id), _mnode(manuscript_id), weight=weight
+            )
+
+    raw_matching = nx.max_weight_matching(weighted, maxcardinality=True, weight="weight")
+    assert len(raw_matching) == target
+
+    chosen: dict[str, str] = {}
+    for a, b in raw_matching:
+        reviewer_id, manuscript_id = (
+            (a[1], b[1]) if a[0] == REVIEWER else (b[1], a[1])
+        )
+        chosen[reviewer_id] = manuscript_id
+
+    free_pairs = sorted(chosen.items())
+    changed = sorted(
+        reviewer_id
+        for reviewer_id, manuscript_id in free_pairs
+        if published_of.get(reviewer_id) != manuscript_id
+    )
+
+    # 强制性/替代分配相对于「锁定已完成者」后的可行解集：
+    # 在剩余子图上标注，锁定边恒为强制；替代分配补回锁定边，
+    # 故任何替代分配都不改变已完成者的配对。
+    annotated = _annotate_perfect_matching(residual_graph, free_pairs)
+
+    full_entries: list[
+        tuple[str, str, bool, list[tuple[str, str]] | None]
+    ] = [
+        (reviewer_id, manuscript_id, True, None)
+        for reviewer_id, manuscript_id in locked_pairs
+    ]
+    for reviewer_id, manuscript_id, forced, alternative in annotated:
+        if alternative is not None:
+            # 补回全部锁定边，形成覆盖全体评审人的完整替代分配。
+            alternative = sorted(alternative + locked_pairs)
+        full_entries.append((reviewer_id, manuscript_id, forced, alternative))
+    full_entries.sort(key=lambda entry: entry[0])
+
+    return ReassignResult(
+        feasible=True,
+        pairs=full_entries,
+        changed_reviewer_ids=changed,
     )

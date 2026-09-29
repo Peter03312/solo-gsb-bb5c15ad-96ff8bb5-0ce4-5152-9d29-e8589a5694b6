@@ -62,6 +62,35 @@ class RepairRequest(AuditRequest):
     )
 
 
+class ReassignRequest(AuditRequest):
+    """POST /reassign 的请求体：已发布分配 + 已完成评审人 + 撤销配对。"""
+
+    published_assignment: list[Pairing] = Field(
+        ...,
+        min_length=1,
+        description="已发布分配：allowed_pairings 上的完美匹配，"
+        "每位评审人与每篇稿件各出现一次",
+    )
+    completed_reviewer_ids: list[str] = Field(
+        default_factory=list,
+        description="已完成评审的评审人 ID 列表（可为空、不得重复）；"
+        "其发布配对既不得撤销也不得改变",
+    )
+    revoked_pairings: list[Pairing] = Field(
+        default_factory=list,
+        description="被撤销的允许配对（可为空、不得重复）；"
+        "必须逐条属于 allowed_pairings，且不得撤销已完成者的发布配对",
+    )
+
+    @field_validator("completed_reviewer_ids")
+    @classmethod
+    def _completed_ids_non_empty(cls, values: list[str]) -> list[str]:
+        for index, value in enumerate(values):
+            if not isinstance(value, str) or not value or not value.strip():
+                raise ValueError(f"位置 {index} 的 ID 不能为空字符串")
+        return values
+
+
 class OutputPair(BaseModel):
     """审计输出中的单条配对。"""
 
@@ -107,6 +136,21 @@ class RepairResponse(BaseModel):
     assignment: list[AssignedPair] = Field(
         description="修复后图（允许配对 + 新增配对）上的字典序最小确定性分配，"
         "并逐对标注强制性"
+    )
+
+
+class ReassignResponse(BaseModel):
+    """撤销配对后的改派成功响应：完整分配及发生改动的评审人。"""
+
+    perfect_match_exists: bool = True
+    assignment: list[AssignedPair] = Field(
+        description="撤销配对并锁定已完成者后的完整分配（按评审人 ID 升序）；"
+        "先使相对已发布分配的改动人数最少，平局按评审人 ID 升序的"
+        "稿件 ID 序列字典序最小；强制性相对于锁定已完成者后的可行解集"
+    )
+    changed_reviewer_ids: list[str] = Field(
+        description="相对已发布分配发生改动的评审人 ID（按 ID 升序）；"
+        "已完成者恒不在其中，无人改动时为空"
     )
 
 
